@@ -276,7 +276,7 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
                 if constexpr (Arch == 90 && !PagedKVNonTMA) {
                     return run_mha_fwd_<90, cutlass::bfloat16_t, 512, 512, Split, false, Has_softcap, PackGQA>(params, stream);
                 }
-                STD_TORCH_CHECK(!PagedKVNonTMA, "FlashAttention forward with head_dim 512 does not support PagedKV non-TMA. Use pagedkv_tma=True or non-paged KV.");
+                TORCH_CHECK(!PagedKVNonTMA, "FlashAttention forward with head_dim 512 does not support PagedKV non-TMA. Use pagedkv_tma=True or non-paged KV.");
             }
             #endif
         } else {
@@ -321,7 +321,7 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
                 if constexpr (Arch == 90 && !PagedKVNonTMA) {
                     return run_mha_fwd_<90, cutlass::half_t, 512, 512, Split, false, Has_softcap, PackGQA>(params, stream);
                 }
-                STD_TORCH_CHECK(!PagedKVNonTMA, "FlashAttention forward with head_dim 512 does not support PagedKV non-TMA. Use pagedkv_tma=True or non-paged KV.");
+                TORCH_CHECK(!PagedKVNonTMA, "FlashAttention forward with head_dim 512 does not support PagedKV non-TMA. Use pagedkv_tma=True or non-paged KV.");
             }
             #endif
             #else
