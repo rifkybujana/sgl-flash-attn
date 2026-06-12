@@ -354,6 +354,14 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
         #ifndef FLASHATTENTION_DISABLE_HDIM256
         if (params.d <= 256) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
         #endif
+        #ifndef FLASHATTENTION_DISABLE_HDIM512
+        if (params.d <= 512) {
+            if constexpr (Arch == 90 && !PagedKVNonTMA) {
+                return run_mha_fwd_<90, cutlass::float_e4m3_t, 512, 512, Split, false, Has_softcap, PackGQA>(params, stream);
+            }
+            TORCH_CHECK(!PagedKVNonTMA, "FlashAttention forward with head_dim 512 does not support PagedKV non-TMA. Use pagedkv_tma=True or non-paged KV.");
+        }
+        #endif
         #else
         TORCH_CHECK(false, "This flash attention build does not support FP8.");
         #endif

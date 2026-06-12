@@ -83,8 +83,13 @@ struct CollectiveMainloopFwdSm90 {
     // Leaving this option here for reference.
     static constexpr bool MmaQK_is_RS = false;
     // We can have MmaPV with P in smem in rmem to reduce register pressure at the cost of more smem.
-    static_assert(!(!MmaPV_is_RS && Is_FP8), "MmaPV must be RS if FP8");
-    static_assert(!(!MmaPV_is_RS && Transpose_V), "MmaPV must be RS if Transpose_V");
+    // FP8 normally requires MmaPV with P in registers (RS). The exception is LargeHeadDimV
+    // (head_dim_v > 256, e.g. gemma-4's d512 global layers): that path is inherently SS (P shipped
+    // through smem across warpgroups), and FP8 SS is supported here via convert_layout_acc_Aregs_maybe_ss
+    // (honest P layout, no register shuffle) + a non-stmatrix P->smem copy. So allow !MmaPV_is_RS when
+    // LargeHeadDimV.
+    static_assert(!(!MmaPV_is_RS && Is_FP8) || LargeHeadDimV, "MmaPV must be RS if FP8 (unless LargeHeadDimV: SS)");
+    static_assert(!(!MmaPV_is_RS && Transpose_V) || LargeHeadDimV, "MmaPV must be RS if Transpose_V (unless LargeHeadDimV: SS)");
 
     // Slightly faster in this case to have WG1 use RS instead of SS to avoid waiting for the P smem write
     static constexpr bool MmaPV_use_RS_WG1 = !MmaPV_is_RS && kHeadDim == 64 && kHeadDimV == 512;
@@ -175,7 +180,14 @@ struct CollectiveMainloopFwdSm90 {
     // Only for LargeHeadDimV where WG0 sends WG1 the scales
     using SmemLayoutScale = cute::Layout<cute::Shape<Int<kBlockM>, Int<kStages>>>;
 
-    using SmemCopyAtomP = Copy_Atom<cute::SM90_U32x4_STSM_N, Element>;
+    // STSM (stmatrix) is a 16-bit op on SM90 (no b8 variant until SM100), so it can't store the 1-byte
+    // FP8 P tile. The FP8 SS path (LargeHeadDimV) writes P with a plain vectorized copy instead; the
+    // honest convert_layout_acc_Aregs_maybe_ss layout makes the register->smem mapping correct.
+    using SmemCopyAtomP = std::conditional_t<
+        Is_FP8 && !MmaPV_is_RS,
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>,
+        Copy_Atom<cute::SM90_U32x4_STSM_N, Element>
+    >;
 
     using SmemLayoutSink = Layout<Shape<_64>>;
 
@@ -1172,11 +1184,13 @@ struct CollectiveMainloopFwdSm90 {
             // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
 
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
-            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
-            Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
+            // FP8 register permutes only apply to the RS path; the SS path (LargeHeadDimV) writes P to
+            // smem with the honest convert_layout_acc_Aregs_maybe_ss layout and needs no shuffle.
+            if constexpr (Is_FP8 && !V_colmajor && MmaPV_is_RS) { flash::permute_Cregs_fp8(tSrS); }
+            Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs_maybe_ss<Is_FP8 && !MmaPV_is_RS, TiledMmaPV>(tSrS.layout()));
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
             convert_type_out(tOrP_acc, tOrP);
-            if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
+            if constexpr (Is_FP8 && V_colmajor && MmaPV_is_RS) { flash::permute_Aregs_fp8(tOrP); }
             if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
             if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             --n_block;
@@ -1217,9 +1231,9 @@ struct CollectiveMainloopFwdSm90 {
                     warpgroup_wait<0>();
                     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
                 }
-                if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
+                if constexpr (Is_FP8 && !V_colmajor && MmaPV_is_RS) { flash::permute_Cregs_fp8(tSrS); }
                 convert_type_out(make_tensor(tSrS.data(), tOrP.layout()), tOrP);
-                if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
+                if constexpr (Is_FP8 && V_colmajor && MmaPV_is_RS) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
                 if constexpr (!RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
@@ -1275,7 +1289,8 @@ struct CollectiveMainloopFwdSm90 {
             warpgroup_wait<0>();
             pipeline_v.consumer_release(smem_pipe_read);  // release V, otherwise producers will hang
             softmax.rescale_o(tOrO, scores_scale);
-            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+            // Output permute only undoes the RS P-register permute; the SS path leaves O in natural order.
+            if constexpr (Is_FP8 && !V_colmajor && MmaPV_is_RS) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
 
         } else {  // No intra-WG overlap
@@ -1310,11 +1325,11 @@ struct CollectiveMainloopFwdSm90 {
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
-                if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
-                Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
+                if constexpr (Is_FP8 && !V_colmajor && MmaPV_is_RS) { flash::permute_Cregs_fp8(tSrS); }
+                Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs_maybe_ss<Is_FP8 && !MmaPV_is_RS, TiledMmaPV>(tSrS.layout()));
                 Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
                 convert_type_out(tOrP_acc, tOrP);
-                if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
+                if constexpr (Is_FP8 && V_colmajor && MmaPV_is_RS) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
                 if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
@@ -1379,7 +1394,7 @@ struct CollectiveMainloopFwdSm90 {
                 cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
             }
             softmax.rescale_o(tOrO, scores_scale);
-            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+            if constexpr (Is_FP8 && !V_colmajor && MmaPV_is_RS) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
         }
         ++work_idx;
@@ -1472,7 +1487,7 @@ struct CollectiveMainloopFwdSm90 {
         load_scales(scores_scale, smem_pipe_read.index());
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
         softmax.rescale_o(tOrO, scores_scale);
-        if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+        if constexpr (Is_FP8 && !V_colmajor && MmaPV_is_RS) { flash::permute_output_fp8(tOrO); }
         ++smem_pipe_read;
         return true;
     }

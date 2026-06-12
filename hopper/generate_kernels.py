@@ -134,8 +134,8 @@ def get_all_kernels() -> List[Kernel]:
          # so we should just pass in packgqa=False to avoid the `_packgqa` in the filename.
         if packgqa and (sm < 90 or (sm >= 90 and (paged_kv or split))):
             continue
-        # Symmetric d=512: SM90 only, BF16/FP16 only (no FP8, no SM80)
-        if head_dim > 256 and (sm < 90 or dtype == "e4m3"):
+        # Symmetric d=512: SM90 only (fp8/e4m3 now supported via the SS LargeHeadDimV path)
+        if head_dim > 256 and sm < 90:
             continue
         # Symmetric d=512 + PagedKV non-TMA: register budget insufficient
         # (384 threads = 256 MMA + 128 producer, 170 reg/thread max, not enough for d=512 WGMMA)

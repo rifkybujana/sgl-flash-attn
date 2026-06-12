@@ -33,7 +33,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
     static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
-    static constexpr bool FP8_TransposeV = Is_FP8 && !V_colmajor;
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
     using ElementSink=cutlass::bfloat16_t;
 
@@ -44,6 +43,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr int kBlockN = Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool MmaPV_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
     static constexpr bool IntraWGOverlap = std::get<3>(kBlockMN_RS_IntraWGOverlap);
+    // The epilogue FP8 column un-permute only compensates the RS P-register permute. The SS path
+    // (LargeHeadDimV, MmaPV_is_RS=false) leaves O in natural order, so it must NOT permute.
+    static constexpr bool FP8_TransposeV = Is_FP8 && !V_colmajor && MmaPV_is_RS;
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
     static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
