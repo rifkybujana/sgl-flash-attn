@@ -414,6 +414,13 @@ inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
     auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f, use_one_mma_wg(params));
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     int const kBlockN = std::get<1>(kBlockMN_kernel_args_sm90);
+    // head_dim > 256 (i.e. 512) has NO non-TMA paged kernel — run_mha_fwd hard-checks
+    // !PagedKVNonTMA for d512 (see the TORCH_CHECK in the d<=512 dispatch). The seqlen_q heuristic
+    // below only exists to pick the faster of {TMA, non-TMA} when both are available; for d512 TMA
+    // is the ONLY paged option, so the heuristic must not gate it (else short prefills with a small
+    // uncached extend — common under prefix caching — and decode (seqlen_q=1) take the non-existent
+    // non-TMA path and crash). page_size % kBlockN == 0 is still required for the TMA block layout.
+    if (params.d > 256) { return params.page_size % kBlockN == 0; }
     // Heuristic: when seqlen_q <= kBlockM, we're not compute bound, and somehow using TMA is slower,
     // at least for MLA.
     return params.page_size % kBlockN == 0 && params.seqlen_q * (params.h / params.h_k) > kBlockM;
