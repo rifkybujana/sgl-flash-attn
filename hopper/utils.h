@@ -192,25 +192,15 @@ CUTLASS_DEVICE auto convert_layout_acc_Aregs(Layout0 acc_layout) {
 };
 
 // Operand-A (P) layout for the FP8 PV GMMA when P is sourced from SMEM (SS), i.e. the LargeHeadDimV
-// (head_dim_v 512) path used by gemma-4's global layers. convert_layout_acc_Aregs's FP8 variant returns
-// the ((4,2,2),...) layout that is only correct AFTER permute_Cregs/Aregs_fp8 register shuffling (the RS
-// path). For SS, P is downcast and written straight to smem, so we need the layout that is honest WITHOUT
-// any shuffle — the "This combination is right but doesn't work with register shuffling" alternative in
-// convert_layout_acc_Aregs. The compile-time Fp8Ss flag keeps the FP8-only static_asserts off the bf16 path.
+// (head_dim_v 512) path used by gemma-4's global layers. The RS path (convert_layout_acc_Aregs) packs P
+// into the FP8 GMMA operand-A register fragment (with permute_Cregs/Aregs_fp8 shuffles). The SS path
+// instead writes P to smem and the GMMA reads it via SmemLayoutP, so we DON'T want the Aregs packing at
+// all: keep P in the QK accumulator (C) layout and let make_tiled_copy_C(_, tiled_mma_qk) map each
+// thread's (m,n) value to sP(m,n). The compile-time Fp8Ss flag selects this passthrough for FP8 SS only.
 template<bool Fp8Ss, typename MMA_Traits, typename Layout0>
 CUTLASS_DEVICE auto convert_layout_acc_Aregs_maybe_ss(Layout0 acc_layout) {
     if constexpr (Fp8Ss) {
-        static_assert(decltype(rank<0>(acc_layout))::value == 3, "FP8 SS Aregs requires the SM90 accumulator layout");
-        static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
-        static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
-        static_assert(decltype(rank(acc_layout))::value == 3);
-        static_assert(decltype(rank(get<0>(acc_layout)))::value == 3);
-        static_assert(decltype(stride<0, 0>(acc_layout))::value == 1);
-        static_assert(decltype(stride<0, 1>(acc_layout))::value == 2);
-        auto l = logical_divide(get<0, 2>(acc_layout), Tile<Layout<Shape<_2, _2>>>{});  // (((2, 2), N / 32))
-        return make_layout(make_layout(coalesce(make_layout(get<0, 0>(acc_layout), get<0, 0, 0>(l))), get<0, 1>(acc_layout), get<0, 0, 1>(l)),
-                           get<1>(acc_layout),
-                           coalesce(make_layout(get<0, 1>(l), get<2>(acc_layout))));  // ((4, 2, 2), MMA_M, N / 32 * MMA_N), honest strides
+        return acc_layout;  // C-accumulator layout passthrough; written straight to sP via make_tiled_copy_C
     } else {
         return convert_layout_acc_Aregs<MMA_Traits>(acc_layout);
     }
