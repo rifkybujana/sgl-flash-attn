@@ -366,8 +366,21 @@ struct CollectiveMainloopFwdSm90 {
         SmemScale_t smem_scale;
         cute::array_aligned<ElementSink, cute::cosize_v<SmemLayoutSink>, 128> smem_sink;
     };
+    // FP8 + SS (MmaPV_is_RS=false, LargeHeadDimV): P is shipped through smem, so the Transpose_V
+    // storage needs smem_p too (the RS variant above keeps no smem_p -> byte-identical for fp8 d256).
+    struct TensorStorageTransposeVWithP : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentV, SmemAlignmentP), _0> {
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutVtMma>, SmemAlignmentV> smem_v;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVt> smem_vt;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
+        SmemQv_t smem_qv;
+        SmemP_t smem_p;
+        SmemScale_t smem_scale;
+        cute::array_aligned<ElementSink, cute::cosize_v<SmemLayoutSink>, 128> smem_sink;
+    };
 
-    using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose, TensorStorageTransposeV>;
+    using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose,
+        std::conditional_t<MmaPV_is_RS, TensorStorageTransposeV, TensorStorageTransposeVWithP>>;
 
     // These are tuned for speed. They don't affect correctness.
     static constexpr bool UseSchedulerBarrier = (IntraWGOverlap
