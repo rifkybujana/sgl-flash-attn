@@ -181,11 +181,13 @@ struct CollectiveMainloopFwdSm90 {
     using SmemLayoutScale = cute::Layout<cute::Shape<Int<kBlockM>, Int<kStages>>>;
 
     // STSM (stmatrix) is a 16-bit op on SM90 (no b8 variant until SM100), so it can't store the 1-byte
-    // FP8 P tile. The FP8 SS path (LargeHeadDimV) writes P with a plain vectorized copy instead; the
-    // honest convert_layout_acc_Aregs_maybe_ss layout makes the register->smem mapping correct.
+    // FP8 P tile. The FP8 SS path (LargeHeadDimV) writes P (in the QK C-accumulator layout) to the
+    // swizzled SmemLayoutP. A 128-bit vectorized copy would store the thread's elements contiguously,
+    // but the swizzle scatters them to non-contiguous addresses -> use a per-element UniversalCopy so
+    // each P[m,n] lands at its correct swizzled sP(m,n).
     using SmemCopyAtomP = std::conditional_t<
         Is_FP8 && !MmaPV_is_RS,
-        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>,
+        Copy_Atom<cute::UniversalCopy<Element>, Element>,
         Copy_Atom<cute::SM90_U32x4_STSM_N, Element>
     >;
 
