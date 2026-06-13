@@ -907,6 +907,19 @@ struct CollectiveMainloopFwdSm90 {
                 shared_storage.pipelines.barrier_V8.wait(v8_phase);
                 Tensor s8 = sVt8(_, _, smem_pipe_write.index());   // (kHeadDimV, kBlockN) fp8 true-swizzle
                 Tensor sc = sVt_c(_, _, smem_pipe_write.index());  // (kHeadDimV, kBlockN) bf16 true-swizzle
+#ifdef FIXPROBE_LAYOUT_DUMP
+                // GROUND TRUTH: resolved physical offsets for a few (r=headdim, c=token) coords + the raw
+                // fp8 value read. Print on the FIRST commit only (thread 0). Reveals whether s8(r,c)/sc(r,c)
+                // land at the layout-formula offsets, and whether the fp8 read returns the expected token.
+                if (dq_thread_idx == 0 && smem_pipe_write.index() == 0) {
+                    auto* s8b = &s8(0, 0); auto* scb = &sc(0, 0);
+                    auto P = [&](int r, int c) {
+                        printf("FIXRT (r=%d,c=%d) off_s8=%ld off_sc=%ld v8=%.2f\n",
+                               r, c, (long)(&s8(r, c) - s8b), (long)(&sc(r, c) - scb), (float)s8(r, c));
+                    };
+                    P(0,0); P(0,1); P(0,2); P(0,8); P(1,0); P(64,0); P(128,0); P(0,16);
+                }
+#endif
                 int const total = kHeadDimV * kBlockN;
                 #pragma unroll 1
                 for (int idx = dq_thread_idx; idx < total; idx += NumProducerThreads) {
