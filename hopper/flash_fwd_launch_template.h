@@ -68,26 +68,17 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementSink>
     >;
 #ifdef FIXPROBE_LAYOUT_DUMP
-    if constexpr (Arch >= 90 && (Is_FP8 || DequantKV) && kHeadDim == 512) {
+    if constexpr (Arch >= 90 && Is_FP8 && kHeadDim == 512) {
         static bool _fixpf = false;
         if (!_fixpf) { _fixpf = true;
-            printf("HOSTFIX d512 DequantKV=%d kBlockN=%d kStages=%d MmaPV_is_RS=%d TmaMajorV(K=%d)=%d MmaMajorV(K=%d)=%d\n",
-                   (int)DequantKV, (int)kBlockN, (int)kStages, (int)MmaPV_is_RS,
+            printf("HOSTFIX d512fp8 kBlockN=%d kStages=%d MmaPV_is_RS=%d TmaMajorV(K=%d)=%d MmaMajorV(K=%d)=%d\n",
+                   (int)kBlockN, (int)kStages, (int)MmaPV_is_RS,
                    (int)cute::GMMA::Major::K, (int)CollectiveMainloop::TmaMajorV, (int)cute::GMMA::Major::K, (int)CollectiveMainloop::MmaMajorV);
             printf("HOSTFIX AtomVt    = "); cute::print(typename CollectiveMainloop::SmemLayoutAtomVt{});    printf("\n");
             printf("HOSTFIX AtomVtMma = "); cute::print(typename CollectiveMainloop::SmemLayoutAtomVtMma{}); printf("\n");
             printf("HOSTFIX Vt        = "); cute::print(typename CollectiveMainloop::SmemLayoutVt{});        printf("\n");
             printf("HOSTFIX VtMma     = "); cute::print(typename CollectiveMainloop::SmemLayoutVtMma{});     printf("\n");
             printf("HOSTFIX SmemLayP  = "); cute::print(typename CollectiveMainloop::SmemLayoutP{});         printf("\n");
-            if constexpr (DequantKV) {
-                printf("HOSTFIX AtomVt8   = "); cute::print(typename CollectiveMainloop::SmemLayoutAtomVt8{}); printf("\n");
-                printf("HOSTFIX Vt8       = "); cute::print(typename CollectiveMainloop::SmemLayoutVt8{});     printf("\n");
-                printf("HOSTFIX AtomK8    = "); cute::print(typename CollectiveMainloop::SmemLayoutAtomK8{});  printf("\n");
-                printf("HOSTFIX K8        = "); cute::print(typename CollectiveMainloop::SmemLayoutK8{});      printf("\n");
-                printf("HOSTFIX K(bf16)   = "); cute::print(typename CollectiveMainloop::SmemLayoutK{});       printf("\n");
-                printf("HOSTFIX pi(Vt)    = "); cute::print(cute::as_position_independent_swizzle_tensor(make_tensor(cute::make_smem_ptr((typename CollectiveMainloop::Element*)nullptr), typename CollectiveMainloop::SmemLayoutVt{})).layout()); printf("\n");
-                printf("HOSTFIX pi(Vt8)   = "); cute::print(cute::as_position_independent_swizzle_tensor(make_tensor(cute::make_smem_ptr((typename CollectiveMainloop::ElementKV*)nullptr), typename CollectiveMainloop::SmemLayoutVt8{})).layout()); printf("\n");
-            }
         }
     }
 #endif
