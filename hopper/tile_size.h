@@ -71,9 +71,10 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             return {128, is_local ? 64 : 128, true, !paged_kv_non_TMA};  // PagedKV uses more registers so we disabled IntraWGOverlap
         } else {
             // headdim > 256 (512), fp8: LargeHeadDimV requires kBlockM <= 64 and MmaPV_is_RS = false
-            // (P sourced from smem, like the bf16 d512 path). fp8 K/V is 1 byte so the Transpose_V
-            // double-V smem at kBlockN=32 (~130KB, kStages=2) fits 228KB. IntraWGOverlap off (LargeHeadDimV).
-            return {64, 32, false, false};
+            // (P sourced from smem). kBlockN MUST be >= 64: the Transpose_V STSM divide uses kBlockN/64,
+            // which is 0 (degenerate -> keys>=2 not transposed -> garbage) at kBlockN=32. kBlockN=64 makes
+            // it 1. SMEM ~228KB (sQ32+sK64+Vt-double128+sP4, fp8 1B), right at the H100/H200 limit.
+            return {64, 64, false, false};
         }
     }
 }
