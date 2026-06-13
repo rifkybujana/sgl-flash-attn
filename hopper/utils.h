@@ -199,11 +199,16 @@ CUTLASS_DEVICE auto convert_layout_acc_Aregs(Layout0 acc_layout) {
 // thread's (m,n) value to sP(m,n). The compile-time Fp8Ss flag selects this passthrough for FP8 SS only.
 template<bool Fp8Ss, typename MMA_Traits, typename Layout0>
 CUTLASS_DEVICE auto convert_layout_acc_Aregs_maybe_ss(Layout0 acc_layout) {
-    // FP8 SS now preps P exactly like RS (permute_Cregs_fp8 + this standard Aregs layout) — the PV
-    // GMMA reads operand A's K-dim in the FP8 fragment order whether from registers (RS) or smem (SS),
-    // so the same k-reorder is required; SS just writes the result to smem. Fp8Ss kept for call-site
-    // clarity but no longer changes the layout.
-    return convert_layout_acc_Aregs<MMA_Traits>(acc_layout);
+    // FP8 SS keeps P in the QK C-accumulator layout and writes it to sP by raw (m,n) coordinate
+    // (make_tiled_copy_C-free), which the probe proved writes every row correctly. permute_Cregs_fp8
+    // is STILL applied to tSrS first: it reorders the key dim to the inverse of the FP8 GMMA's
+    // operand-A smem k-order, so writing the reordered values at logical (m,n) composes with the
+    // GMMA's k-read to recover P[m,k]. (RS path uses the standard Aregs relabel instead.)
+    if constexpr (Fp8Ss) {
+        return acc_layout;
+    } else {
+        return convert_layout_acc_Aregs<MMA_Traits>(acc_layout);
+    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

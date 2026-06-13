@@ -1076,6 +1076,12 @@ struct CollectiveMainloopFwdSm90 {
         Tensor tSrQv = wg_mma_qv.partition_fragment_A(sQv);
         Tensor tSrV = wg_mma_qv.partition_fragment_B(sVMmaQV);
         Tensor tPsP = smem_thr_copy_P.partition_D(cute::as_position_independent_swizzle_tensor(sP));
+        // FP8 SS coordinate write: partition sP by the RAW QK MMA C layout (thread's (m,n) -> sP(m,n),
+        // swizzle handled), element-wise copy of C-layout P. Writes every row correctly (vs the
+        // STSM-flavored tPsP / make_tiled_copy_C path which has no 8-bit analog). permute_Cregs
+        // pre-reorders the key dim so the GMMA's k-read recovers P[m,k].
+        Tensor tCsP = tiled_mma_qk.get_thread_slice(thread_idx).partition_C(
+            cute::as_position_independent_swizzle_tensor(sP));
 
         // For storing scales to smem, only used when LargeHeadDimV
         auto thread_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
@@ -1126,9 +1132,12 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (LargeHeadDimV) {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
             }
-            // P is in the FP8 Aregs layout (permute_Cregs applied), like RS. Write to sP via the same
-            // C-copy as bf16; only the atom differs (UniversalCopy for fp8 since sm90 has no 8-bit STSM).
-            cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP);
+            if constexpr (Is_FP8 && !MmaPV_is_RS) {
+                // FP8 SS: P (permute_Cregs-reordered, C layout) -> sP(m,n) by coordinate; GMMA k-read recovers P[m,k].
+                cute::copy(tOrP, tCsP);
+            } else {
+                cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP);
+            }
         };
 
         auto arrive_on_P_write_barrier = [&] {
