@@ -47,7 +47,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // (LargeHeadDimV, MmaPV_is_RS=false) leaves O in natural order, so it must NOT permute.
     static constexpr bool FP8_TransposeV = Is_FP8 && !V_colmajor;
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
-    static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+    // FP8 d512 (LargeHeadDimV) needs kBlockN>=64 for the V-transpose, but kBlockN=64 with kStages=2
+    // overflows smem (the Transpose_V double-V buffer). Use kStages=1 there to fit (~132KB); no K/V
+    // pipelining (slower) but correct. All other sm90 configs keep kStages=2.
+    static constexpr int kStages = Arch >= 90 ? ((Is_FP8 && kHeadDim > 256) ? 1 : 2) : std::get<3>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
