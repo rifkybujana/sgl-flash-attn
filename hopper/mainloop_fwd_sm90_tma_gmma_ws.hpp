@@ -30,7 +30,8 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSink_, int kBlockH_=1>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSink_, int kBlockH_=1,
+        class ElementKV_ = Element_>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -39,6 +40,13 @@ struct CollectiveMainloopFwdSm90 {
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
+    // ElementKV is the storage dtype of Q/K/V in HBM. Normally == Element (compute dtype). When they
+    // differ (DequantKV), Q/K/V are stored as ElementKV (e.g. fp8 e4m3) and TMA-loaded into a small fp8
+    // staging smem, dequanted (x q/k/v_descale) -> Element (bf16) compute smem, then the PROVEN bf16
+    // GMMA path runs unchanged. Used for the gemma-4 d512 global layers: fp8 KV (2x bandwidth + 2x
+    // capacity) computed in bf16, sidestepping the native fp8-d512 V-transpose key-permutation bug.
+    using ElementKV = ElementKV_;
+    static constexpr bool DequantKV = !cute::is_same_v<ElementKV, Element>;
     using ElementAccum = ElementAccum_;
     using ElementSink = ElementSink_;
     using ArchTag = ArchTag_;
@@ -55,8 +63,15 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
-    static constexpr bool Use_TMA_Q = !PackGQA || PackGQA_TMA;
-    static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
+    // DequantKV loads Q cp.async-style (TMA fp8 -> staging -> dequant -> bf16 smem_q, then a plain
+    // ClusterBarrier where the whole producer warpgroup arrives), so Use_TMA_Q must be false there to
+    // get the right barrier_Q type/count and the right QueryEmpty arrive count in mma_init.
+    static constexpr bool Use_TMA_Q = (!PackGQA || PackGQA_TMA) && !DequantKV;
+    // For DequantKV the COMPUTE K/V pipelines are filled by the producer warpgroup (TMA fp8 -> staging
+    // smem -> dequant -> bf16 compute smem), i.e. cp.async-style (commit via cpasync_barrier_arrive),
+    // exactly like the PagedKVNonTMA path. So the compute pipelines must be PipelineAsync (Use_TMA_KV
+    // false). The fp8 staging loads still use TMA, via our own per-stage staging barriers.
+    static constexpr bool Use_TMA_KV = !PagedKVNonTMA && !DequantKV;
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
@@ -177,6 +192,26 @@ struct CollectiveMainloopFwdSm90 {
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
     using SmemLayoutP = decltype(tile_to_shape(SmemLayoutAtomP{}, select<0, 1>(TileShape_MNK{})));
 
+    // ---- DequantKV fp8 staging layouts (only meaningfully used when DequantKV) ----
+    // TMA loads fp8 Q/K/V into these staging buffers; a dequant pass converts them to the bf16 compute
+    // smem (SmemLayoutQ/K/Vt). Each staging layout mirrors its bf16 counterpart's logical shape but is
+    // built for ElementKV (fp8) so the swizzle/TMA descriptor match the fp8 byte layout in HBM.
+    using SmemLayoutAtomQ8 = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementKV,
+        decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
+    using SmemLayoutQ8 = decltype(tile_to_shape(SmemLayoutAtomQ8{}, select<0, 2>(TileShape_MNK{})));
+    using SmemLayoutAtomK8 = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementKV,
+        decltype(cute::get<1>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
+    using SmemLayoutK8 = decltype(tile_to_shape(
+        SmemLayoutAtomK8{},
+        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
+    // V staging is MN-major (TmaMajorV == MN for the bf16 compute path), matching SmemLayoutVt.
+    using SmemLayoutAtomVt8 = decltype(cutlass::gemm::collective::detail::ss_smem_selector<TmaMajorV, ElementKV,
+                                       Int<kHeadDimV>, decltype(cute::get<2>(TileShape_MNK_PV{}))>());
+    using SmemLayoutVt8 = decltype(tile_to_shape(
+        SmemLayoutAtomVt8{},
+        make_shape(Int<kHeadDimV>{}, shape<2>(TileShape_MNK_PV{}), Int<kStages>{}),
+        std::conditional_t<TmaMajorV == GMMA::Major::K, cute::Step<_1, _2, _3>, cute::Step<_2, _1, _3>>{}));
+
     // Only for LargeHeadDimV where WG0 sends WG1 the scales
     using SmemLayoutScale = cute::Layout<cute::Shape<Int<kBlockM>, Int<kStages>>>;
 
@@ -293,11 +328,35 @@ struct CollectiveMainloopFwdSm90 {
         ClusterShape{}));
     using TMA_Qv = std::conditional_t<HasQv, TMA_Qv_, std::nullptr_t>;
 
+    // ---- DequantKV: TMA descriptors that load fp8 (ElementKV) Q/K/V from HBM into staging smem ----
+    using TMA_Q8 = decltype(make_tma_copy_A_sm90(
+        GmemTiledCopyQ{},
+        make_tensor(make_gmem_ptr(static_cast<ElementKV const*>(nullptr)), ShapeQKV{}, StrideQK{}),
+        SmemLayoutQ8{},
+        TileShape_MNK{},
+        ClusterShape{}));
+    using TMA_K8 = decltype(make_tma_copy_B_sm90(
+        GmemTiledCopyKV{},
+        make_tensor(make_gmem_ptr(static_cast<ElementKV const*>(nullptr)), ShapeQKV{}, StrideQK{}),
+        take<0, 2>(SmemLayoutK8{}),
+        TileShape_MNK{},
+        ClusterShape{}));
+    using TMA_V8 = decltype(make_tma_copy(
+        GmemTiledCopyKV{},
+        make_tensor(make_gmem_ptr(static_cast<ElementKV const*>(nullptr)), ShapeQKV{}, select<1, 0, 2, 3>(StrideV{})),
+        take<0, 2>(SmemLayoutVt8{}),
+        select<1, 2>(TileShape_MNK_PV{}),
+        size<0>(ClusterShape{})));
+
     // Set the bytes transferred in this TMA transaction (may involve multiple issues)
     static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutVt{})) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesQv = static_cast<uint32_t>(size(SmemLayoutQv{}) * cutlass::sizeof_bits_v<Element> / 8);
+    // Staging (fp8) transaction bytes for the DequantKV path.
+    static constexpr uint32_t TmaTransactionBytesQ8 = static_cast<uint32_t>(size(SmemLayoutQ8{}) * cutlass::sizeof_bits_v<ElementKV> / 8);
+    static constexpr uint32_t TmaTransactionBytesK8 = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK8{})) * cutlass::sizeof_bits_v<ElementKV> / 8);
+    static constexpr uint32_t TmaTransactionBytesV8 = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutVt8{})) * cutlass::sizeof_bits_v<ElementKV> / 8);
 
     using PipelineTmaAsync = std::conditional_t<CUTE_STATIC_V(size(ClusterShape{})) == 1, typename cutlass::PipelineTmaAsyncNoCluster<kStages>, typename cutlass::PipelineTmaAsync<kStages>>;
     using MainloopPipelineK = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
@@ -381,8 +440,33 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<ElementSink, cute::cosize_v<SmemLayoutSink>, 128> smem_sink;
     };
 
-    using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose,
-        std::conditional_t<MmaPV_is_RS, TensorStorageTransposeV, TensorStorageTransposeVWithP>>;
+    // DequantKV: the compute path is the proven bf16 d512 SS path (Transpose_V=false, !MmaPV_is_RS,
+    // LargeHeadDimV) so it would normally select TensorStorageWithPScaleNoTranspose. We extend that with
+    // fp8 staging arrays (smem_k8/v8/q8) + per-stage TMA staging barriers. Staging arrays are ElementKV
+    // (1B fp8) so they are small (~16KB/stage for K/V at d512). Gate to DequantKV only (byte-identical
+    // for all other configs).
+    static constexpr size_t SmemAlignmentK8 = cutlass::detail::alignment_for_swizzle(SmemLayoutK8{});
+    static constexpr size_t SmemAlignmentVt8 = cutlass::detail::alignment_for_swizzle(SmemLayoutVt8{});
+    static constexpr size_t SmemAlignmentQ8 = cutlass::detail::alignment_for_swizzle(SmemLayoutQ8{});
+    using SmemK8_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutK8>, cute::max(SmemAlignmentK8, size_t{128})>, cute::array<ElementKV, 0>>;
+    using SmemVt8_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutVt8>, cute::max(SmemAlignmentVt8, size_t{128})>, cute::array<ElementKV, 0>>;
+    using SmemQ8_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutQ8>, cute::max(SmemAlignmentQ8, size_t{128})>, cute::array<ElementKV, 0>>;
+    struct TensorStorageDequant : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP), _0> {
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVtNoTranspose> smem_v;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
+        SmemVt8_t smem_v8;
+        SmemQ8_t smem_q8;
+        SmemK8_t smem_k8;
+        SmemQv_t smem_qv;
+        SmemP_t smem_p;
+        SmemScale_t smem_scale;
+        cute::array_aligned<ElementSink, cute::cosize_v<SmemLayoutSink>, 128> smem_sink;
+    };
+
+    using TensorStorage = std::conditional_t<DequantKV, TensorStorageDequant,
+        std::conditional_t<!Transpose_V, TensorStorageNoTranspose,
+            std::conditional_t<MmaPV_is_RS, TensorStorageTransposeV, TensorStorageTransposeVWithP>>>;
 
     // These are tuned for speed. They don't affect correctness.
     static constexpr bool UseSchedulerBarrier = (IntraWGOverlap
@@ -475,6 +559,9 @@ struct CollectiveMainloopFwdSm90 {
         TMA_K tma_load_K_new;
         TMA_V tma_load_V_new;
         TMA_Qv tma_load_Qv;
+        TMA_Q8 tma_load_Q8;
+        TMA_K8 tma_load_K8;
+        TMA_V8 tma_load_V8;
         float const softmax_scale_log2;
         float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
@@ -548,6 +635,25 @@ struct CollectiveMainloopFwdSm90 {
                 return nullptr;
             }
         }();
+        // DequantKV: build fp8 (ElementKV) staging TMA descriptors. The host hands us Element* (bf16)
+        // ptrs but the underlying bytes are fp8; element-count strides are identical (same logical
+        // [seqlen, d, head, batch] shape), so we just reinterpret the ptr as ElementKV.
+        auto make_tma8 = [&]() {
+            if constexpr (DequantKV) {
+                Tensor mQ8 = make_tensor(make_gmem_ptr(reinterpret_cast<ElementKV const*>(args.ptr_Q)), args.shape_Q, args.stride_Q);
+                TMA_Q8 tma_load_Q8 = make_tma_copy_A_sm90(GmemTiledCopyQ{}, mQ8, SmemLayoutQ8{}, TileShape_MNK{}, ClusterShape{});
+                Tensor mK8 = make_tensor(make_gmem_ptr(reinterpret_cast<ElementKV const*>(args.ptr_K)), args.shape_K, args.stride_K);
+                TMA_K8 tma_load_K8 = make_tma_copy_B_sm90(GmemTiledCopyKV{}, mK8, take<0, 2>(SmemLayoutK8{}), TileShape_MNK{}, ClusterShape{});
+                Tensor mV8 = make_tensor(make_gmem_ptr(reinterpret_cast<ElementKV const*>(args.ptr_V)),
+                                         make_shape(args.headdim_v, get<0>(args.shape_K), get<2>(args.shape_K), get<3>(args.shape_K)),
+                                         select<1, 0, 2, 3>(args.stride_V));
+                TMA_V8 tma_load_V8 = make_tma_copy(GmemTiledCopyKV{}, mV8, take<0, 2>(SmemLayoutVt8{}), select<1, 2>(TileShape_MNK_PV{}), size<0>(ClusterShape{}));
+                return cute::make_tuple(tma_load_Q8, tma_load_K8, tma_load_V8);
+            } else {
+                return cute::make_tuple(TMA_Q8{}, TMA_K8{}, TMA_V8{});
+            }
+        };
+        auto [tma_load_Q8, tma_load_K8, tma_load_V8] = make_tma8();
         // If PackGQA, reshape Q to be ((qhead_per_khead, seqlen_q), head_size, nhead_k, batch_size)
         int const qhead_per_khead = !PackGQA ? 1 : cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K));
         auto const shape_Q_packed = cute::conditional_return<!PackGQA>(
@@ -594,6 +700,7 @@ struct CollectiveMainloopFwdSm90 {
                 cutlass::FastDivmod(!args.ptr_pagetable ? 1 : cute::ceil_div(page_size, kBlockN)),  // blockN_per_page_size_divmod
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
                 tma_load_Q, tma_load_K, tma_load_V, tma_load_K_new, tma_load_V_new, tma_load_Qv,
+                tma_load_Q8, tma_load_K8, tma_load_V8,
                 !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
                 args.ptr_q_descale, args.ptr_k_descale, args.ptr_v_descale,
                 args.stride_q_descale, args.stride_k_descale, args.stride_v_descale,
@@ -608,6 +715,12 @@ struct CollectiveMainloopFwdSm90 {
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
     CUTLASS_DEVICE
     static void prefetch_tma_descriptors(Params const& params) {
+        if constexpr (DequantKV) {
+            cute::prefetch_tma_descriptor(params.tma_load_Q8.get_tma_descriptor());
+            cute::prefetch_tma_descriptor(params.tma_load_K8.get_tma_descriptor());
+            cute::prefetch_tma_descriptor(params.tma_load_V8.get_tma_descriptor());
+            return;
+        }
         if constexpr (Use_TMA_Q) {
             cute::prefetch_tma_descriptor(params.tma_load_Q.get_tma_descriptor());
             if constexpr (HasQv) {
@@ -657,6 +770,171 @@ struct CollectiveMainloopFwdSm90 {
                 return;
             }
         }
+
+        // ================= DequantKV self-contained producer path =================
+        // Loads fp8 (ElementKV) Q/K/V via TMA into staging smem, dequants (x q/k/v_descale) -> bf16
+        // compute smem, then commits the cp.async-style compute pipelines (pipeline_k/pipeline_v) and
+        // barrier_Q. The consumer (mma) then runs the proven bf16 d512 SS path unchanged. Entirely
+        // gated so non-dequant configs are byte-identical.
+        if constexpr (DequantKV) {
+            int const dq_thread_idx = threadIdx.x % NumProducerThreads;
+            int const bidh_kv_dq = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
+            int const bidb_kv_dq = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
+            float const q_descale = params.ptr_q_descale == nullptr ? 1.0f : params.ptr_q_descale[bidb * get<0>(params.stride_q_descale) + bidh_kv_dq * get<1>(params.stride_q_descale)];
+            float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv_dq * get<1>(params.stride_k_descale)];
+            float const v_descale = params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv_dq * get<1>(params.stride_v_descale)];
+
+            bool const is_varlen_q_dq = Varlen && params.cu_seqlens_q;
+
+            // Compute (bf16) smem tensors — what the consumer reads.
+            Tensor sQ_c  = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
+            Tensor sK_c  = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
+            Tensor sVt_c = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
+            Tensor sQ_pi = as_position_independent_swizzle_tensor(sQ_c);
+            Tensor sK_pi_c = as_position_independent_swizzle_tensor(sK_c);
+            Tensor sVt_pi_c = as_position_independent_swizzle_tensor(sVt_c);
+            // Staging (fp8) smem tensors.
+            Tensor sQ8  = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q8.data()), SmemLayoutQ8{});
+            Tensor sK8  = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k8.data()), SmemLayoutK8{});
+            Tensor sVt8 = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v8.data()), SmemLayoutVt8{});
+            Tensor sQ8_pi  = as_position_independent_swizzle_tensor(sQ8);
+            Tensor sK8_pi  = as_position_independent_swizzle_tensor(sK8);
+            Tensor sVt8_pi = as_position_independent_swizzle_tensor(sVt8);
+
+            // gmem TMA tensors for the fp8 staging loads.
+            Tensor mQ8 = params.tma_load_Q8.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q_dq ? bidb : 0);
+            Tensor mK8 = params.tma_load_K8.get_tma_tensor(params.shape_K)(_, _, bidh_kv_dq, _);
+            auto shape_V_dq = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
+            Tensor mVt8 = params.tma_load_V8.get_tma_tensor(shape_V_dq)(_, _, bidh_kv_dq, _);
+            Tensor gQ8  = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ8), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
+            Tensor gK8  = local_tile(domain_offset(make_coord(seqlen_info.offset_k + n_offset, _0{}, _0{}), mK8), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));
+            Tensor gVt8 = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k + n_offset, _0{}), mVt8), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));
+
+            auto block_tma_Q8 = params.tma_load_Q8.get_slice(_0{});
+            Tensor tQgQ8 = group_modes<0, 3>(block_tma_Q8.partition_S(gQ8));
+            Tensor tQsQ8 = group_modes<0, 3>(block_tma_Q8.partition_D(sQ8));
+            auto block_tma_K8 = params.tma_load_K8.get_slice(_0{});
+            Tensor tKgK8 = group_modes<0, 3>(block_tma_K8.partition_S(gK8));
+            Tensor tKsK8 = group_modes<0, 3>(block_tma_K8.partition_D(sK8));
+            auto block_tma_V8 = params.tma_load_V8.get_slice(_0{});
+            Tensor tVgVt8 = group_modes<0, 3>(block_tma_V8.partition_S(gVt8));
+            Tensor tVsVt8 = group_modes<0, 3>(block_tma_V8.partition_D(sVt8));
+
+            int const bidb_kv_idx_dq = !(Varlen && params.cu_seqlens_k) && !params.ptr_pagetable ? bidb_kv_dq : 0;
+            using PagedKVManagerDQ = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, ElementKV, true /*KV_Same_Iter*/>;
+            PagedKVManagerDQ paged_kv_manager_dq(
+                params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
+                reinterpret_cast<ElementKV*>(params.ptr_K), params.shape_K, params.stride_K,
+                reinterpret_cast<ElementKV*>(params.ptr_V), params.headdim_v, params.stride_V,
+                params.page_size_divmod, params.blockN_per_page_size_divmod,
+                bidb_kv_dq, bidh_kv_dq, dq_thread_idx, seqlen_info.seqlen_k - n_offset, seqlen_info.leftpad_k + n_offset, bidb_kv_idx_dq);
+
+            bool const elect_dq = cute::elect_one_sync() && (dq_thread_idx / cutlass::NumThreadsPerWarp) == 0;
+
+            // Re-init the staging barriers at the start of every load() call so their phase parity
+            // resets to 0 (the producer-only K8/V8 barriers are used a *variable* number of times per
+            // work tile, so we can't derive their parity from work_idx — resetting sidesteps that).
+            // Only one thread inits; a producer-warpgroup NamedBarrier + init fence makes it visible.
+            if (dq_thread_idx == 0) {
+                shared_storage.pipelines.barrier_Q8.init(1);
+                shared_storage.pipelines.barrier_K8.init(1);
+                shared_storage.pipelines.barrier_V8.init(1);
+                cutlass::arch::fence_barrier_init();
+            }
+            cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::QueryRotated) /*id*/);
+
+            // Dequant a [rows, cols] fp8 staging swizzle-tensor (one pipeline stage) into its bf16
+            // compute swizzle-tensor, applying descale. Both have identical logical shape; we walk
+            // logical coordinates so each (r,c) lands at its correct swizzled address in both.
+            auto dequant_stage = [&](auto const& s8_pi, auto const& sc_pi, int rows, int cols, float descale) {
+                int const total = rows * cols;
+                #pragma unroll 1
+                for (int idx = dq_thread_idx; idx < total; idx += NumProducerThreads) {
+                    int const r = idx % rows;
+                    int const c = idx / rows;
+                    float const x = static_cast<float>(s8_pi(r, c)) * descale;
+                    sc_pi(r, c) = static_cast<Element>(x);
+                }
+            };
+
+            // ---- Load + dequant Q (single buffer) ----
+            if (elect_dq) {
+                shared_storage.pipelines.barrier_Q8.arrive_and_expect_tx(TmaTransactionBytesQ8);
+                copy(params.tma_load_Q8.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q8), 0, TMA::CacheHintSm90::EVICT_LAST),
+                     tQgQ8, tQsQ8);
+            }
+
+            // ---- Main K/V loop: TMA fp8 -> staging -> dequant -> bf16 compute pipelines ----
+            auto load_dequant_K = [&](int const n_block, auto const& smem_pipe_write) {
+                pipeline_k.producer_acquire(smem_pipe_write);
+                if (elect_dq) {
+                    auto [n_block_idx, bidb_kv_i] = paged_kv_manager_dq.get_indices_for_K_TMA();
+                    shared_storage.pipelines.barrier_K8.arrive_and_expect_tx(TmaTransactionBytesK8);
+                    copy(params.tma_load_K8.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_K8), 0, TMA::CacheHintSm90::EVICT_LAST),
+                         tKgK8(_, n_block_idx, bidb_kv_i), tKsK8(_, smem_pipe_write.index()));
+                }
+            };
+            auto commit_dequant_K = [&](int const k8_phase, auto const& smem_pipe_write) {
+                shared_storage.pipelines.barrier_K8.wait(k8_phase);
+                dequant_stage(sK8_pi(_, _, smem_pipe_write.index()), sK_pi_c(_, _, smem_pipe_write.index()), kBlockN, kHeadDim, k_descale);
+                cutlass::arch::fence_view_async_shared();
+                pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+            };
+            auto load_dequant_V = [&](int const n_block, auto const& smem_pipe_write) {
+                pipeline_v.producer_acquire(smem_pipe_write);
+                if (elect_dq) {
+                    auto [n_block_idx, bidb_kv_i] = paged_kv_manager_dq.get_indices_for_V_TMA();
+                    shared_storage.pipelines.barrier_V8.arrive_and_expect_tx(TmaTransactionBytesV8);
+                    copy(params.tma_load_V8.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_V8), 0, TMA::CacheHintSm90::EVICT_LAST),
+                         tVgVt8(_, n_block_idx, bidb_kv_i), tVsVt8(_, smem_pipe_write.index()));
+                }
+            };
+            auto commit_dequant_V = [&](int const v8_phase, auto const& smem_pipe_write) {
+                shared_storage.pipelines.barrier_V8.wait(v8_phase);
+                dequant_stage(sVt8_pi(_, _, smem_pipe_write.index()), sVt_pi_c(_, _, smem_pipe_write.index()), kHeadDimV, kBlockN, v_descale);
+                cutlass::arch::fence_view_async_shared();
+                pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+            };
+
+            int n_block_dq = n_block_max - 1;
+            // Each staging barrier toggles phase per stage; with kStages possibly 1 the barrier phase
+            // flips every load. Track per-barrier phase manually (init phase 0).
+            int k8_phase = 0, v8_phase = 0;
+
+            // Q dequant: wait for staging Q, dequant -> smem_q, arrive barrier_Q (cp.async-style).
+            cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
+            shared_storage.pipelines.barrier_Q8.wait(0);
+            dequant_stage(sQ8_pi, sQ_pi, kBlockM, kHeadDim, q_descale);
+            cutlass::arch::fence_view_async_shared();
+            // Producer-internal warpgroup sync so smem_q is fully written before arriving barrier_Q.
+            // QueryRotated is unused by the consumer when !AppendKV (our case), so it's free to reuse.
+            cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::QueryRotated) /*id*/);
+            {
+                auto &barrier_Q = shared_storage.pipelines.barrier_Q;
+                if (dq_thread_idx == 0) { cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Q)); }
+                barrier_Q.arrive();
+            }
+
+            // Wait for MMA WGs to release smem_v before reloading (matches the non-dequant barrier_O wait).
+            shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
+
+            #pragma unroll 1
+            for (; n_block_dq >= n_block_min; --n_block_dq) {
+                // KV_Same_Iter: resolve the page-table index for THIS n_block, then K and V both use it.
+                if (elect_dq) { paged_kv_manager_dq.load_page_table_TMA(n_block_dq); }
+                load_dequant_K(n_block_dq, smem_pipe_write);
+                commit_dequant_K(k8_phase, smem_pipe_write);
+                k8_phase ^= 1;
+                load_dequant_V(n_block_dq, smem_pipe_write);
+                commit_dequant_V(v8_phase, smem_pipe_write);
+                v8_phase ^= 1;
+                ++smem_pipe_write;
+            }
+            scheduler_prefetch();
+            ++work_idx;
+            return;
+        }
+        // =============== end DequantKV path ===============
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});

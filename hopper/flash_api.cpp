@@ -357,7 +357,10 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
         #ifndef FLASHATTENTION_DISABLE_HDIM512
         if (params.d <= 512) {
             if constexpr (Arch == 90 && !PagedKVNonTMA) {
-                return run_mha_fwd_<90, cutlass::float_e4m3_t, 512, 512, Split, false, Has_softcap, PackGQA>(params, stream);
+                // DEQUANT-IN-KERNEL: the native fp8 d512 path has a proven V-transpose key-permutation
+                // bug (gemma-4 global layers). Instead, load fp8 KV/Q and dequant -> bf16 in smem, then
+                // run the PROVEN bf16 d512 SS path (Transpose_V=false -> the permutation cannot occur).
+                return run_mha_fwd_dequant_<90, 512, 512, Split, Has_softcap, PackGQA>(params, stream);
             }
             TORCH_CHECK(!PagedKVNonTMA, "FlashAttention forward with head_dim 512 does not support PagedKV non-TMA. Use pagedkv_tma=True or non-paged KV.");
         }

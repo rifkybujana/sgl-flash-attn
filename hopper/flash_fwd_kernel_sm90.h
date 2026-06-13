@@ -110,6 +110,11 @@ public:
             alignas(16) BarrierQ barrier_Q;
             alignas(16) BarrierQ barrier_Qv;
             alignas(16) cutlass::arch::ClusterBarrier barrier_O;
+            // DequantKV: per-stage TMA staging-load completion barriers (fp8 Q/K/V -> staging smem).
+            // Tiny (8B each); only init+used when CollectiveMainloop::DequantKV.
+            alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_Q8;
+            alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_K8;
+            alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_V8;
             alignas(16) typename CollectiveMainloop::MainloopPipelineK::SharedStorage pipeline_k;
             alignas(16) typename CollectiveMainloop::MainloopPipelineV::SharedStorage pipeline_v;
             alignas(16) typename CollectiveMainloop::MainloopPipelineVt::SharedStorage pipeline_vt;
@@ -217,6 +222,12 @@ public:
                 shared_storage.pipelines.barrier_Qv.init(Use_TMA_Q ? 1 : NumProducerThreads /*numThreads*/);
             }
             shared_storage.pipelines.barrier_O.init(size(ClusterShape{}) * (Use_TMA_O ? 1 : NumMmaThreads) /*numThreads*/);
+            if constexpr (CollectiveMainloop::DequantKV) {
+                // One leader thread issues each staging TMA (arrive_and_expect_tx); init count 1.
+                shared_storage.pipelines.barrier_Q8.init(1);
+                shared_storage.pipelines.barrier_K8.init(1);
+                shared_storage.pipelines.barrier_V8.init(1);
+            }
         }
 
         // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();

@@ -27,12 +27,15 @@ using namespace cute;
 
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
-          bool PackGQA, bool Split, bool V_colmajor, bool Use_one_mma_wg>
+          bool PackGQA, bool Split, bool V_colmajor, bool Use_one_mma_wg, typename ElementKV = Element>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
     static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
+    // DequantKV: KV stored as ElementKV (fp8) but computed as Element (bf16). The compute path is the
+    // proven bf16 d512 SS path; only the producer load dequants. Element here is the COMPUTE dtype.
+    static constexpr bool DequantKV = !cute::is_same_v<ElementKV, Element>;
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
     using ElementSink=cutlass::bfloat16_t;
 
@@ -50,7 +53,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // FP8 d512 (LargeHeadDimV) needs kBlockN>=64 for the V-transpose, but kBlockN=64 with kStages=2
     // overflows smem (the Transpose_V double-V buffer). Use kStages=1 there to fit (~132KB); no K/V
     // pipelining (slower) but correct. All other sm90 configs keep kStages=2.
-    static constexpr int kStages = Arch >= 90 ? ((Is_FP8 && kHeadDim > 256) ? 1 : 2) : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+    // FP8-native d512 forces kStages=1 (Transpose_V smem). DequantKV d512 also uses kStages=1: smem
+    // budget at d512 (sQ 64KB + sK/sV bf16 32KB each + fp8 staging 16KB each) fits ~166KB only at 1
+    // stage; kStages=2 overflows the 228KB cap.
+    static constexpr int kStages = Arch >= 90 ? (((Is_FP8 || DequantKV) && kHeadDim > 256) ? 1 : 2) : std::get<3>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
@@ -58,7 +64,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
     using CollectiveMainloop = std::conditional_t<
         Arch >= 90,
-        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, ElementSink>,
+        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, ElementSink, 1 /*kBlockH*/, ElementKV>,
         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementSink>
     >;
 #ifdef FIXPROBE_LAYOUT_DUMP
@@ -248,6 +254,24 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                     });
                 });
             });
+        });
+    });
+}
+
+// DequantKV dispatch: compute in bf16 (Element), load KV (and Q) as fp8 e4m3 (ElementKV). Scoped to the
+// d512 (LargeHeadDimV) symmetric path used by the gemma-4 global layers — no V_colmajor / HasQv /
+// AppendKV / cluster / one_mma_wg (all irrelevant or unsupported for the bf16 d512 SS path). The
+// compute path is byte-for-byte the proven bf16 d512 kernel; only the producer dequants.
+template<int Arch, int kHeadDim, int kHeadDimV, bool Split, bool Has_softcap, bool PackGQA>
+void run_mha_fwd_dequant_(Flash_fwd_params &params, cudaStream_t stream) {
+    using Element = cutlass::bfloat16_t;
+    using ElementKV = cutlass::float_e4m3_t;
+    using T_out = cutlass::bfloat16_t;
+    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
+        VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
+            run_flash_fwd<Arch, kHeadDim, kHeadDimV, 1 /*ClusterM*/, Element, T_out, Is_causal, Is_local, Has_softcap, Varlen,
+                          false /*PagedKVNonTMA*/, false /*AppendKV*/, false /*HasQv*/, PackGQA, Split, false /*V_colmajor*/,
+                          false /*Use_one_mma_wg*/, ElementKV>(params, stream);
         });
     });
 }

@@ -42,6 +42,16 @@ template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {
 #endif
 """
 
+# DequantKV: compute bf16, load KV/Q as fp8 e4m3. Scoped to the symmetric d512 gemma-4 global layers.
+KERNEL_IMPL_TEMPLATE_FWD_DEQUANT_SM90 = """#include "flash_fwd_launch_template.h"
+
+#ifndef FLASHATTENTION_DISABLE_FP8
+#ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
+template void run_mha_fwd_dequant_<{ARCH}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+#endif
+#endif
+"""
+
 KERNEL_IMPL_TEMPLATE_FWD_SM8x = """#include "flash_fwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_SM8x
@@ -94,6 +104,14 @@ class Kernel:
 
     @property
     def template(self) -> str:
+        if self.direction == "fwd_dequant":
+            # bf16 compute, e4m3 KV/Q load. PackGQA always-on for paged/split here too.
+            packgqa = self.packgqa or self.paged_kv or self.split
+            return KERNEL_IMPL_TEMPLATE_FWD_DEQUANT_SM90.format(
+                ARCH=str(self.sm), HEAD_DIM=self.head_dim, HEAD_DIM_V=self.head_dim_v,
+                SPLIT=str(self.split).lower(), SOFTCAP=str(self.softcap).lower(),
+                PACKGQA=str(packgqa).lower()
+            )
         if self.direction == "fwd":
             if self.sm == 90:
                 # Always enable PackGQA for PagedKV or Split to reduce compilation
@@ -125,6 +143,10 @@ class Kernel:
 
     @property
     def filename(self) -> str:
+        if self.direction == "fwd_dequant":
+            # Name under the bf16 family so the dev-loop `flash_fwd_hdim512_bf16*_sm90.cu` glob picks it
+            # up. dtype tag "bf16kv8" = bf16 compute + fp8 (e4m3) KV load.
+            return f"flash_fwd_hdim{self.head_dim}_bf16kv8{'_split' if self.split else ''}{'_softcap' if self.softcap else ''}{'_packgqa' if self.packgqa else ''}_sm{self.sm}.cu"
         return f"flash_{self.direction}_hdim{self.head_dim}{f'_{self.head_dim_v}' if self.head_dim_v != self.head_dim else ''}_{self.dtype}{'_paged' if self.paged_kv else ''}{'_split' if self.split else ''}{'_softcap' if self.softcap else ''}{'_packgqa' if self.packgqa else ''}_sm{self.sm}.cu"
 
 
@@ -150,6 +172,13 @@ def get_all_kernels() -> List[Kernel]:
         if sm == 90 and head_dim == 64 and dtype in ["bf16", "fp16"]:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=256, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
+    # DequantKV (bf16 compute + e4m3 KV/Q load) for the symmetric d512 gemma-4 global layers, SM90.
+    for split, softcap, packgqa in itertools.product(SPLIT, SOFTCAP, PACKGQA):
+        # PackGQA is forced on for split (the d512 dispatch sets PackGQA = PackGQA_ || Split); skip the
+        # packgqa=False x split=True file (it would duplicate packgqa=True x split=True).
+        if packgqa and split:
+            continue
+        yield Kernel(sm=90, dtype="e4m3", head_dim=512, head_dim_v=512, split=split, paged_kv=False, softcap=softcap, packgqa=packgqa, direction="fwd_dequant")
     for dtype, head_dim, softcap, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SOFTCAP, SM):
         if head_dim > 256:  # No backward for d>256
             continue
