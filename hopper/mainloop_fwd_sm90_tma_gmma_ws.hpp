@@ -1316,8 +1316,10 @@ struct CollectiveMainloopFwdSm90 {
             warpgroup_wait<0>();
             pipeline_v.consumer_release(smem_pipe_read);  // release V, otherwise producers will hang
             softmax.rescale_o(tOrO, scores_scale);
-            // Output permute only undoes the RS P-register permute; the SS path leaves O in natural order.
-            if constexpr (Is_FP8 && !V_colmajor && MmaPV_is_RS) { flash::permute_output_fp8(tOrO); }
+            // permute_output_fp8 un-permutes the V-transpose column permutation -> needed for BOTH RS
+            // and SS (independent of the P-register permute, which SS skips). Confirmed empirically:
+            // without it, fp8 SS O is a column-permutation of the correct result (same norm).
+            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
 
         } else {  // No intra-WG overlap
@@ -1421,7 +1423,7 @@ struct CollectiveMainloopFwdSm90 {
                 cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
             }
             softmax.rescale_o(tOrO, scores_scale);
-            if constexpr (Is_FP8 && !V_colmajor && MmaPV_is_RS) { flash::permute_output_fp8(tOrO); }
+            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
         }
         ++work_idx;
@@ -1514,7 +1516,7 @@ struct CollectiveMainloopFwdSm90 {
         load_scales(scores_scale, smem_pipe_read.index());
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
         softmax.rescale_o(tOrO, scores_scale);
-        if constexpr (Is_FP8 && !V_colmajor && MmaPV_is_RS) { flash::permute_output_fp8(tOrO); }
+        if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
         ++smem_pipe_read;
         return true;
     }
