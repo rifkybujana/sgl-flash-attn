@@ -1076,12 +1076,11 @@ struct CollectiveMainloopFwdSm90 {
         Tensor tSrQv = wg_mma_qv.partition_fragment_A(sQv);
         Tensor tSrV = wg_mma_qv.partition_fragment_B(sVMmaQV);
         Tensor tPsP = smem_thr_copy_P.partition_D(cute::as_position_independent_swizzle_tensor(sP));
-        // FP8 SS coordinate write: partition sP by the RAW QK MMA C layout (thread's (m,n) -> sP(m,n),
-        // swizzle handled), element-wise copy of C-layout P. Writes every row correctly (vs the
-        // STSM-flavored tPsP / make_tiled_copy_C path which has no 8-bit analog). permute_Cregs
-        // pre-reorders the key dim so the GMMA's k-read recovers P[m,k].
-        Tensor tCsP = tiled_mma_qk.get_thread_slice(thread_idx).partition_C(
-            cute::as_position_independent_swizzle_tensor(sP));
+        // FP8 SS coordinate write: partition the SWIZZLED sP DIRECTLY by the QK MMA C layout. A plain
+        // element copy must write to the true swizzled addresses (NOT as_position_independent_swizzle,
+        // which is for STSM-style copies and only matched the first swizzle block -> keys 0,1 ok, >=2
+        // wrong). The GMMA reads sP swizzled, so this is consistent for every key. No permute_Cregs.
+        Tensor tCsP = tiled_mma_qk.get_thread_slice(thread_idx).partition_C(sP);
 
         // For storing scales to smem, only used when LargeHeadDimV
         auto thread_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
@@ -1212,11 +1211,11 @@ struct CollectiveMainloopFwdSm90 {
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             // FP8 register permutes only apply to the RS path; the SS path (LargeHeadDimV) writes P to
             // smem with the honest convert_layout_acc_Aregs_maybe_ss layout and needs no shuffle.
-            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
+            if constexpr (Is_FP8 && !V_colmajor && MmaPV_is_RS) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs_maybe_ss<Is_FP8 && !MmaPV_is_RS, TiledMmaPV>(tSrS.layout()));
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
             convert_type_out(tOrP_acc, tOrP);
-            if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
+            if constexpr (Is_FP8 && V_colmajor && MmaPV_is_RS) { flash::permute_Aregs_fp8(tOrP); }
             if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
             if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             --n_block;
@@ -1257,9 +1256,9 @@ struct CollectiveMainloopFwdSm90 {
                     warpgroup_wait<0>();
                     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
                 }
-                if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
+                if constexpr (Is_FP8 && !V_colmajor && MmaPV_is_RS) { flash::permute_Cregs_fp8(tSrS); }
                 convert_type_out(make_tensor(tSrS.data(), tOrP.layout()), tOrP);
-                if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
+                if constexpr (Is_FP8 && V_colmajor && MmaPV_is_RS) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
                 if constexpr (!RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
@@ -1353,11 +1352,11 @@ struct CollectiveMainloopFwdSm90 {
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
-                if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
+                if constexpr (Is_FP8 && !V_colmajor && MmaPV_is_RS) { flash::permute_Cregs_fp8(tSrS); }
                 Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs_maybe_ss<Is_FP8 && !MmaPV_is_RS, TiledMmaPV>(tSrS.layout()));
                 Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
                 convert_type_out(tOrP_acc, tOrP);
-                if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
+                if constexpr (Is_FP8 && V_colmajor && MmaPV_is_RS) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
                 if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
