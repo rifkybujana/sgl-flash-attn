@@ -65,8 +65,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     if constexpr (Arch >= 90 && Is_FP8 && kHeadDim == 512) {
         static bool _fixpf = false;
         if (!_fixpf) { _fixpf = true;
-            printf("HOSTFIX d512fp8 kBlockN=%d kStages=%d MmaPV_is_RS=%d kVtSwizzleMN=%d TmaMajorV(K=%d)=%d MmaMajorV(K=%d)=%d\n",
-                   (int)kBlockN, (int)kStages, (int)MmaPV_is_RS, (int)CollectiveMainloop::kVtSwizzleMN,
+            printf("HOSTFIX d512fp8 kBlockN=%d kStages=%d MmaPV_is_RS=%d TmaMajorV(K=%d)=%d MmaMajorV(K=%d)=%d\n",
+                   (int)kBlockN, (int)kStages, (int)MmaPV_is_RS,
                    (int)cute::GMMA::Major::K, (int)CollectiveMainloop::TmaMajorV, (int)cute::GMMA::Major::K, (int)CollectiveMainloop::MmaMajorV);
             printf("HOSTFIX AtomVt    = "); cute::print(typename CollectiveMainloop::SmemLayoutAtomVt{});    printf("\n");
             printf("HOSTFIX AtomVtMma = "); cute::print(typename CollectiveMainloop::SmemLayoutAtomVtMma{}); printf("\n");

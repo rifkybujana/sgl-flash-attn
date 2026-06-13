@@ -142,17 +142,8 @@ struct CollectiveMainloopFwdSm90 {
         SmemLayoutAtomK{},
         make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
 
-    // FP8 d512 V-key-permutation fix: the transpose SOURCE atom (SmemLayoutAtomVt, MN-major) keys its
-    // swizzle off kHeadDimV (512 -> MN_SW128, 3 swizzle bits), but the transpose DEST / GMMA-operand-B-read
-    // atom (SmemLayoutAtomVtMma, K-major) keys off the K extent = kBlockN (fp8 d512: 64 -> K_SW64, 2 bits;
-    // fp8 d256: kBlockN=128 -> K_SW128). The extra source swizzle bit over the 8-element key super-block
-    // rotates key-index bits {1,2,3} (the proven one-hot key map [0,1,8,9,2,3,10,11,...] 3-cycle). Cap the
-    // MN swizzle driver to gcd(kHeadDimV,kBlockN) WHEN TRANSPOSING so source SW == dest SW: gcd(512,64)=64
-    // -> MN_SW64 (matches dest). d256-fp8 gcd(256,128)=128 -> MN_SW128 (byte-identical to before); bf16
-    // (Transpose_V=false) keeps Int<kHeadDimV> (untouched). Element count / smem unchanged (512%64==0).
-    static constexpr int kVtSwizzleMN = Transpose_V ? cute::gcd(int(kHeadDimV), int(kBlockN)) : int(kHeadDimV);
     using SmemLayoutAtomVt = decltype(cutlass::gemm::collective::detail::ss_smem_selector<TmaMajorV, Element,
-                                      Int<kVtSwizzleMN>, decltype(cute::get<2>(TileShape_MNK_PV{}))>());
+                                      Int<kHeadDimV>, decltype(cute::get<2>(TileShape_MNK_PV{}))>());
     using SmemLayoutVt = decltype(tile_to_shape(
         SmemLayoutAtomVt{},
         make_shape(Int<kHeadDimV>{}, shape<2>(TileShape_MNK_PV{}), Int<kStages>{}),
