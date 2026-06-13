@@ -220,6 +220,9 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
+// DequantKV: compute bf16, load Q/K/V as fp8 e4m3 (gemma-4 d512 global layers).
+template <int Arch, int kHeadDim, int kHeadDimV, bool Split, bool Has_softcap, bool PackGQA>
+void run_mha_fwd_dequant_(Flash_fwd_params &params, cudaStream_t stream);
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);

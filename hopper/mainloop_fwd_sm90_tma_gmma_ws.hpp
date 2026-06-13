@@ -932,9 +932,9 @@ struct CollectiveMainloopFwdSm90 {
             }
             scheduler_prefetch();
             ++work_idx;
-            return;
-        }
-        // =============== end DequantKV path ===============
+        } else {
+        // =============== non-dequant producer path (also guards instantiation: the body below mixes
+        // TMA copies with Use_TMA_KV/Use_TMA_Q assumptions that don't hold for DequantKV) ===============
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
@@ -1145,7 +1145,7 @@ struct CollectiveMainloopFwdSm90 {
                         tQvgQv, tQvsQv);
                 }
             }
-        } else {  // Load Q with cp.async
+        } else {  // Load Q with cp.async (only reached when !DequantKV, guarded by the outer if constexpr)
             cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
             Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
@@ -1208,6 +1208,7 @@ struct CollectiveMainloopFwdSm90 {
         ++smem_pipe_write;
         // At the end, all threads have the correct smem_pipe_write.
         ++work_idx;
+        }  // end if constexpr (!DequantKV)
     }
 
     template <typename SharedStorage>
