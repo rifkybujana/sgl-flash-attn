@@ -259,35 +259,6 @@ struct CollectiveMainloopFwdSm90 {
         Copy_Atom<SM90_U32x4_STSM_N, Element>{}, Layout<STSM_thread_shape, STSM_thread_stride>{},
         Layout<STSM_value_shape, STSM_value_stride>{}));
 
-    // ---- DequantKV V dequant tiled copy ----
-    // The V staging->compute dequant is a smem(fp8)->reg->smem(bf16) copy on the MN-major V tile
-    // (logical shape (kHeadDimV, kBlockN)). The fp8 staging and bf16 compute smem use DIFFERENT
-    // swizzle atoms (the swizzle atom is element-size dependent: fp8=1B, bf16=2B). A naive per-element
-    // logical-coordinate copy over position-independent-swizzle tensors does NOT land at matching
-    // physical slots across swizzle blocks (same failure mode as the P SS write), scattering the token
-    // dim. Instead we partition the TRUE swizzled fp8/bf16 tensors with ONE tiled copy (same thread +
-    // value layout), so partition_S/partition_D resolve each tensor's own swizzle per element. We use a
-    // per-element UniversalCopy atom (correctness over vectorization; this is a small per-stage cost).
-    // Thread layout tiles the contiguous headdim leading dim; value layout covers the rest of the tile
-    // so exactly one tile spans (kHeadDimV, kBlockN).
-    // Threads tile the contiguous headdim (mode 0); each thread owns kDequantVValM headdim x the full
-    // kBlockN token columns. The thread/value tiler product is exactly (kHeadDimV, kBlockN), so one tile
-    // spans the whole stage slice. Both S2R and R2S use the SAME thr/val layout so register element i is
-    // the same logical (headdim, token) coordinate in source and dest (descale is per-element scalar, so
-    // any element ordering within a thread is fine as long as it matches between S and D).
-    static constexpr int kDequantVThrM = cute::gcd(kHeadDimV, NumProducerThreads);
-    static_assert(NumProducerThreads % kDequantVThrM == 0);
-    static_assert(kHeadDimV % kDequantVThrM == 0);
-    static constexpr int kDequantVValM = kHeadDimV / kDequantVThrM;
-    using DequantVThrLayout = Layout<Shape<Int<kDequantVThrM>, _1>>;
-    using DequantVValLayout = Layout<Shape<Int<kDequantVValM>, Int<kBlockN>>>;
-    using S2RTiledCopyDequantV = decltype(make_tiled_copy(
-        Copy_Atom<cute::UniversalCopy<ElementKV>, ElementKV>{},
-        DequantVThrLayout{}, DequantVValLayout{}));
-    using R2STiledCopyDequantV = decltype(make_tiled_copy(
-        Copy_Atom<cute::UniversalCopy<Element>, Element>{},
-        DequantVThrLayout{}, DequantVValLayout{}));
-
     using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
     using GmemTiledCopyKV = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{})));
 
@@ -925,27 +896,24 @@ struct CollectiveMainloopFwdSm90 {
                          tVgVt8(_, n_block_idx, bidb_kv_i), tVsVt8(_, smem_pipe_write.index()));
                 }
             };
-            // V dequant uses a tiled copy through registers over the TRUE swizzled tensors (sVt8/sVt_c,
-            // NOT position-independent) so each tensor's own swizzle is resolved per element. See the
-            // S2RTiledCopyDequantV/R2STiledCopyDequantV comment for why the per-element logical copy
-            // (which works for the K-major K tile) scatters the MN-major V token dim.
-            S2RTiledCopyDequantV s2r_tiled_copy_dq_v;
-            R2STiledCopyDequantV r2s_tiled_copy_dq_v;
-            auto s2r_thr_copy_dq_v = s2r_tiled_copy_dq_v.get_thread_slice(dq_thread_idx);
-            auto r2s_thr_copy_dq_v = r2s_tiled_copy_dq_v.get_thread_slice(dq_thread_idx);
+            // V dequant: per-element logical copy over the TRUE swizzled tensors sVt8/sVt_c (NOT the
+            // position-independent views). The layout dump proved as_position_independent_swizzle_tensor
+            // CORRUPTS the bf16 V swizzle (Sw<3,4,3> -> Sw<3,3,3>), so the old _pi write scattered the
+            // token dim by kHeadDimV/64. The fp8 and bf16 swizzle ATOMS differ ((128,4) vs (64,8) headdim
+            // decomposition) but each tensor's operator()(r,c) composes its OWN true swizzle, so a logical
+            // (r,c)->(r,c) copy reads V[token=c,hd=r] from fp8 staging and writes the slot GMMA reads as
+            // (token=c,hd=r). Same precedent as the P SS write (must use true swizzle, not _pi).
             auto commit_dequant_V = [&](int const v8_phase, auto const& smem_pipe_write) {
                 shared_storage.pipelines.barrier_V8.wait(v8_phase);
-                // Partition the true swizzled stage slices: source fp8, dest bf16, same thread/value layout.
-                Tensor tDsVt8 = s2r_thr_copy_dq_v.partition_S(sVt8(_, _, smem_pipe_write.index()));
-                Tensor tDsVt_c = r2s_thr_copy_dq_v.partition_D(sVt_c(_, _, smem_pipe_write.index()));
-                Tensor tDrVt8 = make_fragment_like(tDsVt8);              // fp8 regs
-                Tensor tDrVt_c = make_tensor<Element>(shape(tDrVt8));    // bf16 regs
-                cute::copy(s2r_tiled_copy_dq_v, tDsVt8, tDrVt8);
-                #pragma unroll
-                for (int i = 0; i < size(tDrVt8); ++i) {
-                    tDrVt_c(i) = static_cast<Element>(static_cast<float>(tDrVt8(i)) * v_descale);
+                Tensor s8 = sVt8(_, _, smem_pipe_write.index());   // (kHeadDimV, kBlockN) fp8 true-swizzle
+                Tensor sc = sVt_c(_, _, smem_pipe_write.index());  // (kHeadDimV, kBlockN) bf16 true-swizzle
+                int const total = kHeadDimV * kBlockN;
+                #pragma unroll 1
+                for (int idx = dq_thread_idx; idx < total; idx += NumProducerThreads) {
+                    int const r = idx % kHeadDimV;  // headdim (contiguous / MN-major leading dim)
+                    int const c = idx / kHeadDimV;  // token
+                    sc(r, c) = static_cast<Element>(static_cast<float>(s8(r, c)) * v_descale);
                 }
-                cute::copy(r2s_tiled_copy_dq_v, tDrVt_c, tDsVt_c);
                 cutlass::arch::fence_view_async_shared();
                 pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
             };
