@@ -681,16 +681,6 @@ struct CollectiveMainloopFwdSm90 {
         }();
         // Only used if Transpose_V
         Tensor sV = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{}));
-#ifdef FIXPROBE_LAYOUT_DUMP
-        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-            printf("FIXPROBE_V2 kHeadDimV=%d kBlockN=%d Transpose_V=%d MmaPV_is_RS=%d kVtSwizzleMN=%d\n",
-                   int(kHeadDimV), int(kBlockN), int(Transpose_V), int(MmaPV_is_RS), int(kVtSwizzleMN));
-            cute::print("FIXPROBE AtomVt    = "); cute::print(SmemLayoutAtomVt{});    cute::print("\n");
-            cute::print("FIXPROBE AtomVtMma = "); cute::print(SmemLayoutAtomVtMma{}); cute::print("\n");
-            cute::print("FIXPROBE Vt        = "); cute::print(SmemLayoutVt{});        cute::print("\n");
-            cute::print("FIXPROBE VtMma     = "); cute::print(SmemLayoutVtMma{});     cute::print("\n");
-        }
-#endif
         // Only used if we're using cp.async to load V
         Tensor sVcpasync = [&] {
             if constexpr (!Transpose_V) {
@@ -779,13 +769,6 @@ struct CollectiveMainloopFwdSm90 {
         static constexpr int Transpose_ILP = (size<2>(tTranssVt_) * size<3>(tTranssVt_)) % 2 == 0 ? 2 : 1;
         Tensor tTranssVt = logical_divide(group_modes<1, rank(tTranssVt_) - 1>(tTranssVt_), Shape<Underscore, Int<Transpose_ILP>>{});  // ((16, 1), (2, kHeadDim / 64 * kBlockN / 32 / 2), kStages)
         Tensor tTranssV = logical_divide(group_modes<1, rank(tTranssV_) - 1>(tTranssV_), Shape<Underscore, Int<Transpose_ILP>>{});  // ((16, 1), (2, kHeadDim / 64 * kBlockN / 32 / 2), kStages)
-#ifdef FIXPROBE_LAYOUT_DUMP
-        if (thread_idx == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-            cute::print("FIXPROBE tTranssVt(LDSMsrc) = "); cute::print(tTranssVt.layout()); cute::print("\n");
-            cute::print("FIXPROBE tTranssV (STSMdst) = "); cute::print(tTranssV.layout());  cute::print("\n");
-            cute::print("FIXPROBE ILP_iters="); cute::print(size<1,1>(tTranssVt)); cute::print("\n");
-        }
-#endif
         auto transpose_V = [&](int stage) {
             if constexpr (Transpose_V) {
                 #pragma unroll

@@ -61,6 +61,21 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, ElementSink>,
         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementSink>
     >;
+#ifdef FIXPROBE_LAYOUT_DUMP
+    if constexpr (Arch >= 90 && Is_FP8 && kHeadDim == 512) {
+        static bool _fixpf = false;
+        if (!_fixpf) { _fixpf = true;
+            printf("HOSTFIX d512fp8 kBlockN=%d kStages=%d MmaPV_is_RS=%d kVtSwizzleMN=%d TmaMajorV(K=%d)=%d MmaMajorV(K=%d)=%d\n",
+                   (int)kBlockN, (int)kStages, (int)MmaPV_is_RS, (int)CollectiveMainloop::kVtSwizzleMN,
+                   (int)cute::GMMA::Major::K, (int)CollectiveMainloop::TmaMajorV, (int)cute::GMMA::Major::K, (int)CollectiveMainloop::MmaMajorV);
+            printf("HOSTFIX AtomVt    = "); cute::print(typename CollectiveMainloop::SmemLayoutAtomVt{});    printf("\n");
+            printf("HOSTFIX AtomVtMma = "); cute::print(typename CollectiveMainloop::SmemLayoutAtomVtMma{}); printf("\n");
+            printf("HOSTFIX Vt        = "); cute::print(typename CollectiveMainloop::SmemLayoutVt{});        printf("\n");
+            printf("HOSTFIX VtMma     = "); cute::print(typename CollectiveMainloop::SmemLayoutVtMma{});     printf("\n");
+            printf("HOSTFIX SmemLayP  = "); cute::print(typename CollectiveMainloop::SmemLayoutP{});         printf("\n");
+        }
+    }
+#endif
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV>;
 
     static constexpr int NumProducerThreads = Arch >= 90 ? CollectiveMainloop::NumProducerThreads : CollectiveMainloop::NumMmaThreads;
