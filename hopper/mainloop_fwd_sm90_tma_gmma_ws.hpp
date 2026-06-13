@@ -1076,6 +1076,13 @@ struct CollectiveMainloopFwdSm90 {
         Tensor tSrQv = wg_mma_qv.partition_fragment_A(sQv);
         Tensor tSrV = wg_mma_qv.partition_fragment_B(sVMmaQV);
         Tensor tPsP = smem_thr_copy_P.partition_D(cute::as_position_independent_swizzle_tensor(sP));
+        // FP8 SS: tPsP above is STSM-value-flavored (make_tiled_copy_C bakes in the stmatrix value
+        // layout), which has no 8-bit analog on sm90. Instead partition sP by the RAW QK MMA C layout
+        // (same mapping taccOcO uses for scales): thread's C element (m,n) -> sP(m,n). Then a plain
+        // element-wise copy of the C-layout P writes each P[m,n] to its correct swizzled sP(m,n), and
+        // the PV GMMA reads sP(m,k=n) consistently.
+        Tensor tCsP = tiled_mma_qk.get_thread_slice(thread_idx).partition_C(
+            cute::as_position_independent_swizzle_tensor(sP));
 
         // For storing scales to smem, only used when LargeHeadDimV
         auto thread_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
@@ -1126,7 +1133,12 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (LargeHeadDimV) {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
             }
-            cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP);
+            if constexpr (Is_FP8 && !MmaPV_is_RS) {
+                // FP8 SS: tOrP is C-layout; write each P[m,n] to sP(m,n) by raw C partition (no STSM).
+                cute::copy(tOrP, tCsP);
+            } else {
+                cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP);
+            }
         };
 
         auto arrive_on_P_write_barrier = [&] {
