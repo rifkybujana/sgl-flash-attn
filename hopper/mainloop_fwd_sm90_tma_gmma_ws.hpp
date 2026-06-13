@@ -448,16 +448,21 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr size_t SmemAlignmentK8 = cutlass::detail::alignment_for_swizzle(SmemLayoutK8{});
     static constexpr size_t SmemAlignmentVt8 = cutlass::detail::alignment_for_swizzle(SmemLayoutVt8{});
     static constexpr size_t SmemAlignmentQ8 = cutlass::detail::alignment_for_swizzle(SmemLayoutQ8{});
-    using SmemK8_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutK8>, cute::max(SmemAlignmentK8, size_t{128})>, cute::array<ElementKV, 0>>;
-    using SmemVt8_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutVt8>, cute::max(SmemAlignmentVt8, size_t{128})>, cute::array<ElementKV, 0>>;
-    using SmemQ8_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutQ8>, cute::max(SmemAlignmentQ8, size_t{128})>, cute::array<ElementKV, 0>>;
-    struct TensorStorageDequant : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP), _0> {
+    // The fp8 staging is reused across phases: Q8 is consumed (dequanted -> bf16 smem_q) BEFORE the K/V
+    // loop, and K8/V8 are only used inside the loop. So Q8 and {K8,V8} never coexist -> overlap them in
+    // a single staging byte region sized max(cosize(Q8), cosize(K8)+cosize(V8)) to stay under the 228KB
+    // smem cap (separate buffers overflowed: launch failed "invalid argument" at the kernel launch).
+    static constexpr size_t StagingAlign = cute::max(SmemAlignmentK8, SmemAlignmentVt8, SmemAlignmentQ8, size_t{128});
+    static constexpr size_t StagingBytes = DequantKV
+        ? cute::max(cute::cosize_v<SmemLayoutQ8> * sizeof(ElementKV),
+                    cute::cosize_v<SmemLayoutK8> * sizeof(ElementKV) + cute::cosize_v<SmemLayoutVt8> * sizeof(ElementKV))
+        : size_t{0};
+    using SmemStaging_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, StagingBytes / sizeof(ElementKV), StagingAlign>, cute::array<ElementKV, 0>>;
+    struct TensorStorageDequant : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP, StagingAlign), _0> {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVtNoTranspose> smem_v;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
-        SmemVt8_t smem_v8;
-        SmemQ8_t smem_q8;
-        SmemK8_t smem_k8;
+        SmemStaging_t smem_staging;  // holds Q8, then {K8 | V8}
         SmemQv_t smem_qv;
         SmemP_t smem_p;
         SmemScale_t smem_scale;
@@ -793,10 +798,12 @@ struct CollectiveMainloopFwdSm90 {
             Tensor sQ_pi = as_position_independent_swizzle_tensor(sQ_c);
             Tensor sK_pi_c = as_position_independent_swizzle_tensor(sK_c);
             Tensor sVt_pi_c = as_position_independent_swizzle_tensor(sVt_c);
-            // Staging (fp8) smem tensors.
-            Tensor sQ8  = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q8.data()), SmemLayoutQ8{});
-            Tensor sK8  = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k8.data()), SmemLayoutK8{});
-            Tensor sVt8 = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v8.data()), SmemLayoutVt8{});
+            // Staging (fp8) smem tensors — all view into the shared smem_staging region. Q8 occupies it
+            // first (offset 0); after Q is dequanted, K8 (offset 0) and V8 (offset cosize(K8)) reuse it.
+            ElementKV* staging_ptr = shared_storage.tensors.mainloop.smem_staging.data();
+            Tensor sQ8  = make_tensor(make_smem_ptr(staging_ptr), SmemLayoutQ8{});
+            Tensor sK8  = make_tensor(make_smem_ptr(staging_ptr), SmemLayoutK8{});
+            Tensor sVt8 = make_tensor(make_smem_ptr(staging_ptr + cute::cosize_v<SmemLayoutK8>), SmemLayoutVt8{});
             Tensor sQ8_pi  = as_position_independent_swizzle_tensor(sQ8);
             Tensor sK8_pi  = as_position_independent_swizzle_tensor(sK8);
             Tensor sVt8_pi = as_position_independent_swizzle_tensor(sVt8);
