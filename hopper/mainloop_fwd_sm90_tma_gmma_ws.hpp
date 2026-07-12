@@ -903,6 +903,16 @@ struct CollectiveMainloopFwdSm90 {
         for (; n_block >= n_block_min; --n_block) {
             PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
             ++smem_pipe_write;
+            if constexpr (Transpose_V && kStages == 1) {
+                // kStages=1 (fp8 d512): the load_V below reuses the SAME vt stage the pending
+                // transpose still holds. Warp0's elected thread would block in
+                // pipeline_vt.producer_acquire while warps 1-3 wait for it at the 128-thread
+                // TransposeBarrier inside copy_Vt_to_V -> circular wait = DEADLOCK on the 2nd
+                // n_block (any seqlen_k > kBlockN; single-block probes never hit it). Transpose
+                // FIRST (releasing vt), then issue the next V load. kStages>=2 keeps the original
+                // order (the acquire targets the other, free stage).
+                copy_Vt_to_V(smem_pipe_write_v);
+            }
             if (should_load_KV) {
                 if constexpr (PagedKVNonTMA) {
                     paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
@@ -920,7 +930,7 @@ struct CollectiveMainloopFwdSm90 {
                 }
             }
             n_block_prev = n_block;
-            if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
+            if constexpr (Transpose_V && kStages != 1) { copy_Vt_to_V(smem_pipe_write_v); }
         }
         scheduler_prefetch();
         if constexpr (!Transpose_V && IntraWGOverlap) {
