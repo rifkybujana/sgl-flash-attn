@@ -1076,11 +1076,30 @@ struct CollectiveMainloopFwdSm90 {
         Tensor tSrQv = wg_mma_qv.partition_fragment_A(sQv);
         Tensor tSrV = wg_mma_qv.partition_fragment_B(sVMmaQV);
         Tensor tPsP = smem_thr_copy_P.partition_D(cute::as_position_independent_swizzle_tensor(sP));
-        // FP8 SS coordinate write: partition the SWIZZLED sP DIRECTLY by the QK MMA C layout. A plain
-        // element copy must write to the true swizzled addresses (NOT as_position_independent_swizzle,
-        // which is for STSM-style copies and only matched the first swizzle block -> keys 0,1 ok, >=2
-        // wrong). The GMMA reads sP swizzled, so this is consistent for every key. No permute_Cregs.
-        Tensor tCsP = tiled_mma_qk.get_thread_slice(thread_idx).partition_C(sP);
+        // FP8 SS coordinate write: partition the SWIZZLED sP by the QK MMA C layout and copy per
+        // element — but through a KEY-PERMUTED view of sP. The fp8 Transpose_V (LDSM.T + byte_perm
+        // + STSM) lands V[k] at smem key slot pi(k), where pi rotates key bits {1,2,3}
+        // (b1->b2->b3->b1), local to each 16-key block. (Host-layout simulation of the transpose
+        // chain reproduces the GPU one-hot probe shift == pi^{-1} exactly, and shows the SAME pi on
+        // the working d256 config — the permutation is intentional, not a d512 bug.) The RS path
+        // compensates by shuffling P's registers (permute_Aregs_fp8); the SS path must equivalently
+        // write P[m,k] to sP(m, pi(k)) so the PV GMMA pairs P and V on the same key. The hd-side
+        // column permute of Transpose_V remains compensated by permute_output_fp8 in the epilogue
+        // (FP8_TransposeV), unchanged. NB: a config mixing RS-WG1 with SS-WG2 (hdim64/hdimv512 fp8)
+        // would need permute_Aregs_fp8 on WG1 alongside this view; not a shipped config.
+        static_assert(!(Is_FP8 && !MmaPV_is_RS) || kBlockN % 16 == 0);
+        auto sP_pv_key_view = [&] {
+            if constexpr (Is_FP8 && !MmaPV_is_RS) {
+                using PermKeyP = Layout<Shape<_2, _2, _2, _2, Int<kBlockN / 16>>,
+                                        Stride<_1, _4, _8, _2, _16>>;
+                return make_tensor(sP.data(),
+                                   composition(sP.layout(),
+                                               make_tile(make_layout(Int<kBlockM>{}), PermKeyP{})));
+            } else {
+                return sP;
+            }
+        }();
+        Tensor tCsP = tiled_mma_qk.get_thread_slice(thread_idx).partition_C(sP_pv_key_view);
 
         // For storing scales to smem, only used when LargeHeadDimV
         auto thread_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
@@ -1132,7 +1151,8 @@ struct CollectiveMainloopFwdSm90 {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
             }
             if constexpr (Is_FP8 && !MmaPV_is_RS) {
-                // FP8 SS: P (permute_Cregs-reordered, C layout) -> sP(m,n) by coordinate; GMMA k-read recovers P[m,k].
+                // FP8 SS: honest C-layout P written by coordinate through the key-permuted sP view
+                // (tCsP), so the GMMA k-read pairs P with the transpose-permuted V (see tCsP above).
                 cute::copy(tOrP, tCsP);
             } else {
                 cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP);
